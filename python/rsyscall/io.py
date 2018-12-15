@@ -37,7 +37,7 @@ import struct
 import array
 import trio
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import fcntl
 import errno
@@ -663,12 +663,9 @@ class EpollWaiter:
             self.running_wait = running_wait
             try:
                 if self.wait_readable is not None:
-                    logger.info("sleeping before wait")
                     # yield away first
                     await trio.sleep(0)
-                    logger.info("performing a wait")
                     received_events = await self.wait(maxevents=32, timeout=0)
-                    logger.info("got from wait %s", received_events)
                     if len(received_events) == 0:
                         await self.wait_readable()
                         # We are only guaranteed to receive events from the following line because
@@ -1171,7 +1168,6 @@ class ProcessResources:
         stack_struct.r8  = int(arg5)
         stack_struct.r9  = int(arg6)
         stack_struct.function = ffi.cast('void*', int(function.pointer.near))
-        logger.info("trampoline_func %s", self.trampoline_func.pointer)
         packed_trampoline_addr = struct.pack('Q', int(self.trampoline_func.pointer.near))
         stack = packed_trampoline_addr + bytes(ffi.buffer(stack_struct))
         return stack
@@ -1668,19 +1664,15 @@ class ChildTaskMonitor:
 
     async def do_wait(self) -> None:
         if self.running_wait is not None:
-            logger.info("waiting on child task event")
             await self.running_wait.wait()
         else:
-            logger.info("waiting on child task doing it myself")
             running_wait = trio.Event()
             self.running_wait = running_wait
             try:
                 if not self.can_waitid:
                     # we don't care what information we get from the signal, we just want to
                     # sleep until a SIGCHLD happens
-                    logger.info("doing signal queue read")
                     await self.signal_queue.read()
-                    logger.info("done with signal queue read")
                     self.can_waitid = True
                 # loop on waitid to flush all child events
                 task = self.waiting_task
@@ -1694,13 +1686,10 @@ class ChildTaskMonitor:
                     # have to serialize against things which use pids; we can't do a wait
                     # while something else is making a syscall with a pid, because we
                     # might collect the zombie for that pid and cause pid reuse
-                    logger.info("taking waitid lock")
                     async with self.wait_lock:
-                        logger.info("entering waitid")
                         siginfo = await memsys.waitid(
                             task.syscall, task.transport, task.allocator,
                             None, lib._WALL|lib.WEXITED|lib.WSTOPPED|lib.WCONTINUED|lib.WNOHANG)
-                        logger.info("done with waitid")
                 except ChildProcessError:
                     # no more children
                     logger.info("no more children")
@@ -1727,7 +1716,6 @@ class ChildTaskMonitor:
                     # any more events to the same ChildTask.
                     del self.task_map[child_event.pid]
             finally:
-                logger.info("leaving child task doing it myself")
                 self.running_wait = None
                 running_wait.set()
 
@@ -1858,9 +1846,7 @@ async def launch_futex_monitor(task: base.Task, transport: base.MemoryTransport,
     stack_data = process_resources.build_trampoline_stack(process_resources.futex_helper_func, futex_pointer, futex_value)
     # TODO we need appropriate alignment here, we're just lucky because the alignment works fine by accident right now
     stack_pointer = serializer.serialize_data(stack_data)
-    logger.info("about to serialize")
     async with serializer.with_flushed(transport, allocator):
-        logger.info("did serialize")
         futex_task = await monitor.clone(
             task,
             lib.CLONE_VM|lib.CLONE_FILES|signal.SIGCHLD, stack_pointer.pointer,
@@ -2038,45 +2024,36 @@ class ChildConnection(base.SyscallInterface):
 
     async def _read_syscall_response(self) -> int:
         response: int
-        try:
-            async with trio.open_nursery() as nursery:
-                async def read_response() -> None:
-                    nonlocal response
-                    response = await self.rsyscall_connection.read_response()
-                    self.logger.info("read syscall response")
-                    nursery.cancel_scope.cancel()
-                async def server_exit() -> None:
-                    # meaning the server exited
+        async with trio.open_nursery() as nursery:
+            async def read_response() -> None:
+                nonlocal response
+                response = await self.rsyscall_connection.read_response()
+                nursery.cancel_scope.cancel()
+            async def server_exit() -> None:
+                # meaning the server exited
+                try:
+                    await self.server_task.wait_for_exit()
+                except:
+                    raise
+                raise ChildExit()
+            async def futex_exit() -> None:
+                if self.futex_task is not None:
+                    # meaning the server called exec or exited; we don't
+                    # wait to see which one.
                     try:
-                        self.logger.info("enter server exit")
-                        await self.server_task.wait_for_exit()
+                        await self.futex_task.wait_for_exit()
                     except:
-                        self.logger.info("out of server exit")
                         raise
-                    raise ChildExit()
-                async def futex_exit() -> None:
-                    if self.futex_task is not None:
-                        # meaning the server called exec or exited; we don't
-                        # wait to see which one.
-                        try:
-                            self.logger.info("enter futex exit")
-                            await self.futex_task.wait_for_exit()
-                        except:
-                            self.logger.info("out of futex exit")
-                            raise
-                        raise MMRelease()
-                nursery.start_soon(read_response)
-                nursery.start_soon(server_exit)
-                nursery.start_soon(futex_exit)
-        finally:
-            self.logger.info("out of syscall response nursery")
+                    raise MMRelease()
+            nursery.start_soon(read_response)
+            nursery.start_soon(server_exit)
+            nursery.start_soon(futex_exit)
         raise_if_error(response)
         return response
 
     async def _process_response_for(self, response: SyscallResponse) -> None:
         try:
             ret = await self._read_syscall_response()
-            self.logger.info("returned syscall response")
         except Exception as e:
             response.set_exception(e)
         else:
@@ -2333,6 +2310,37 @@ class LocalMemoryTransport(base.MemoryTransport):
         return ret
 
 @dataclass
+class OneAtATime:
+    running: t.Optional[trio.Event] = None
+
+    @contextlib.asynccontextmanager
+    async def needs_run(self) -> t.AsyncGenerator[bool, None]:
+        if self.running is not None:
+            yield False
+            await self.running.wait()
+        else:
+            running = trio.Event()
+            self.running = running
+            try:
+                yield True
+            finally:
+                self.running = None
+                running.set()
+
+@dataclass
+class SocketMemoryTransportWrite:
+    parent: SocketMemoryTransport
+    dest: Pointer
+    data: bytes
+    done: bool = False
+
+    def __await__(self) -> t.Generator[t.Any, t.Any, None]:
+        async def doit() -> None:
+            while not self.done:
+                await self.parent._do_writes()
+        return doit().__await__()
+
+@dataclass
 class SocketMemoryTransport(base.MemoryTransport):
     """This class wraps a pair of connected file descriptors, one of which is in the local address space.
 
@@ -2349,6 +2357,8 @@ class SocketMemoryTransport(base.MemoryTransport):
     local: AsyncFileDescriptor[ReadableWritableFile]
     remote: handle.FileDescriptor
     lock: trio.Lock
+    pending_writes: t.List[SocketMemoryTransportWrite] = field(default_factory=list)
+    running_write: OneAtATime = field(default_factory=OneAtATime)
 
     @property
     def remote_is_local(self) -> bool:
@@ -2357,7 +2367,7 @@ class SocketMemoryTransport(base.MemoryTransport):
     def inherit(self, task: handle.Task) -> SocketMemoryTransport:
         return SocketMemoryTransport(self.local, task.make_fd_handle(self.remote), self.lock)
 
-    async def _unlocked_single_write(self, dest: Pointer, data: bytes) -> None:
+    async def _direct_single_write(self, dest: Pointer, data: bytes) -> None:
         src = base.to_local_pointer(data)
         n = len(data)
         if self.remote_is_local:
@@ -2383,12 +2393,12 @@ class SocketMemoryTransport(base.MemoryTransport):
             nursery.start_soon(read)
             nursery.start_soon(write)
 
-    async def _unlocked_batch_write(self, ops: t.List[t.Tuple[Pointer, bytes]]) -> None:
+    async def _direct_batch_write(self, ops: t.List[t.Tuple[Pointer, bytes]]) -> None:
         ops = sorted(ops, key=lambda op: int(op[0]))
         ops = merge_adjacent_writes(ops)
         if len(ops) <= 1:
             [(dest, data)] = ops
-            await self._unlocked_single_write(dest, data)
+            await self._direct_single_write(dest, data)
         else:
             # TODO use an iovec
             # build the full iovec at the start
@@ -2397,14 +2407,29 @@ class SocketMemoryTransport(base.MemoryTransport):
             # on partial read, fall back to unlocked_single_write for the rest of that section,
             # then go back to an incremented iovec
             for dest, data in ops:
-                await self._unlocked_single_write(dest, data)
+                await self._direct_single_write(dest, data)
+
+    def _start_single_write(self, dest: Pointer, data: bytes) -> SocketMemoryTransportWrite:
+        write = SocketMemoryTransportWrite(self, dest, data)
+        self.pending_writes.append(write)
+        return write
+
+    async def _do_writes(self) -> None:
+        async with self.running_write.needs_run() as needs_run:
+            if needs_run:
+                writes = self.pending_writes
+                self.pending_writes = []
+                await self._direct_batch_write([(write.dest, write.data) for write in writes])
+                for write in writes:
+                    write.done = True
 
     async def write(self, dest: Pointer, data: bytes) -> None:
-        await self.batch_write([(dest, data)])
+        await self._start_single_write(dest, data)
 
     async def batch_write(self, ops: t.List[t.Tuple[Pointer, bytes]]) -> None:
-        async with self.lock:
-            await self._unlocked_batch_write(ops)
+        write_ops = [self._start_single_write(dest, data) for (dest, data) in ops]
+        for op in write_ops:
+            await op
 
     async def _unlocked_single_read(self, src: Pointer, n: int) -> bytes:
         buf = bytearray(n)
@@ -2445,9 +2470,7 @@ class SocketMemoryTransport(base.MemoryTransport):
         return data
 
     async def batch_read(self, ops: t.List[t.Tuple[Pointer, int]]) -> t.List[bytes]:
-        logger.info("trying to take lock")
         async with self.lock:
-            logger.info("took lock")
             return (await self._unlocked_batch_read(ops))
 
 

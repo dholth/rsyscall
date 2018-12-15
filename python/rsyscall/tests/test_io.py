@@ -486,6 +486,14 @@ class TestIO(unittest.TestCase):
                     await child_task.wait_for_exit()
         trio.run(self.runner, test)
 
+    def test_ssh_which(self) -> None:
+        async def test(stdtask: StandardTask) -> None:
+            async with ssh_to_localhost(stdtask) as ssh_command:
+                local_child, remote_stdtask = await rsyscall.io.spawn_ssh(
+                    stdtask, ssh_command)
+                bash = await rsyscall.io.which(remote_stdtask, b"bash")
+        trio.run(self.runner, test)
+
     def test_copy(self) -> None:
         async def test(stdtask: StandardTask) -> None:
             async with (await stdtask.mkdtemp()) as tmpdir:
