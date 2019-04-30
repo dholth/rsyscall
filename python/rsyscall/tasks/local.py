@@ -103,7 +103,7 @@ async def _make_local_stdtask() -> StandardTask:
         do_cloexec_func=_make_local_function_handle(lib.rsyscall_do_cloexec),
         stop_then_close_func=_make_local_function_handle(lib.rsyscall_stop_then_close),
         trampoline_func=_make_local_function_handle(lib.rsyscall_trampoline),
-        futex_helper_func=_make_local_function(lib.rsyscall_futex_helper),
+        futex_helper_func=_make_local_function_handle(lib.rsyscall_futex_helper),
     )
     filesystem_resources = rsc.FilesystemResources.make_from_environ(task, environ)
     epoller = await mem_task.make_epoll_center()

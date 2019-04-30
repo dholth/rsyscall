@@ -1138,7 +1138,7 @@ class ProcessResources:
     do_cloexec_func: handle.Pointer[handle.NativeFunction]
     stop_then_close_func: handle.Pointer[handle.NativeFunction]
     trampoline_func: handle.Pointer[handle.NativeFunction]
-    futex_helper_func: FunctionPointer
+    futex_helper_func: handle.Pointer[handle.NativeFunction]
 
     @staticmethod
     def make_from_symbols(task: handle.Task, symbols: t.Any) -> ProcessResources:
@@ -1155,7 +1155,7 @@ class ProcessResources:
             do_cloexec_func=to_handle(symbols.rsyscall_do_cloexec),
             stop_then_close_func=to_handle(symbols.rsyscall_stop_then_close),
             trampoline_func=to_handle(symbols.rsyscall_trampoline),
-            futex_helper_func=to_pointer(symbols.rsyscall_futex_helper),
+            futex_helper_func=to_handle(symbols.rsyscall_futex_helper),
         )
 
     def build_trampoline_stack(self, function: FunctionPointer, arg1=0, arg2=0, arg3=0, arg4=0, arg5=0, arg6=0) -> bytes:
@@ -1322,7 +1322,7 @@ class StandardTask:
         thread_maker = ThreadMaker(self.task, self.child_monitor, self.process)
         task, thread = await spawn_rsyscall_thread(
             access_sock, remote_sock,
-            self.task, thread_maker, self.process.server_func,
+            self.task, thread_maker, self.process,
             newuser=newuser, newpid=newpid, fs=fs, sighand=sighand,
         )
         await remote_sock.invalidate()
@@ -1639,9 +1639,9 @@ class ChildProcessMonitorInternal:
         self.processes: t.List[ChildProcess] = []
 
     def add_task(self, process: handle.Process) -> ChildProcess:
-        process = ChildProcess(process, self)
-        self.processes.append(process)
-        return process
+        proc = ChildProcess(process, self)
+        self.processes.append(proc)
+        return proc
 
     async def clone(self,
                     clone_task: base.Task,
@@ -1721,6 +1721,13 @@ class ChildProcessMonitor:
         if self.use_clone_parent:
             flags |= CLONE.PARENT
         return (await self.internal.clone(self.cloning_task, flags, child_stack, ctid, newtls))
+
+    async def new_clone(self, flags: CLONE,
+                        child_stack: t.Tuple[handle.Pointer[Stack], WrittenPointer[Stack]],
+                        ctid: t.Optional[handle.Pointer]=None) -> t.Tuple[ChildProcess, handle.Pointer[Stack]]:
+        if self.use_clone_parent:
+            flags |= CLONE.PARENT
+        return (await self.internal.new_clone(self.cloning_task, flags, child_stack, ctid=ctid))
 
 class Thread:
     """A thread is a child task currently running in the address space of its parent.
@@ -1804,15 +1811,15 @@ class CThread(Thread):
     TODO thread-local-storage.
 
     """
-    stack_mapping: memory.AnonymousMapping
-    def __init__(self, thread: Thread, stack_mapping: memory.AnonymousMapping) -> None:
+    stack: handle.Pointer
+    def __init__(self, thread: Thread, stack: handle.Pointer) -> None:
         super().__init__(thread.child_task, thread.futex_task, thread.futex_mapping)
-        self.stack_mapping = stack_mapping
+        self.stack = stack
 
     async def wait_for_mm_release(self) -> ChildProcess:
         result = await super().wait_for_mm_release()
         # we can free the stack mapping now that the thread has left our address space
-        await self.stack_mapping.unmap()
+        self.stack.free()
         return result
 
     async def __aenter__(self) -> 'CThread':
@@ -1841,25 +1848,24 @@ class BufferedStack:
         self.buffer = b""
         return self.allocation_pointer
 
-async def launch_futex_monitor(task: base.Task, transport: base.MemoryTransport, allocator: memory.AllocatorInterface,
+async def launch_futex_monitor(task: Task,
                                process_resources: ProcessResources, monitor: ChildProcessMonitor,
                                futex_pointer: Pointer, futex_value: int) -> ChildProcess:
-    def op(sem: BatchSemantics) -> BatchPointer:
-        # TODO we need appropriate alignment here, we're just lucky because the alignment works fine by accident right now
-        return sem.to_pointer(
-            process_resources.build_trampoline_stack(process_resources.futex_helper_func, futex_pointer, futex_value))
-    logger.info("about to serialize")
-    async with contextlib.AsyncExitStack() as stack:
-        stack_pointer = await perform_batch(transport, allocator, stack, op)
-        logger.info("did serialize")
-        futex_task = await monitor.clone(lib.CLONE_VM|lib.CLONE_FILES|signal.SIGCHLD, stack_pointer.ptr)
-        # wait for futex helper to SIGSTOP itself,
-        # which indicates the trampoline is done and we can deallocate the stack.
-        event = await futex_task.wait_for_stop_or_exit()
-        if event.died():
-            raise Exception("thread internal futex-waiting task died unexpectedly", event)
-        # resume the futex_task so it can start waiting on the futex
-        await futex_task.send_signal(signal.SIGCONT)
+    async def op(sem: batch.BatchSemantics) -> t.Tuple[handle.Pointer[Stack], WrittenPointer[Stack]]:
+        stack_value = process_resources.make_trampoline_stack(Trampoline(
+            process_resources.futex_helper_func, [int(futex_pointer), futex_value]))
+        stack_buf = sem.malloc_type(handle.Stack, 4096)
+        stack = await stack_buf.write_to_end(stack_value, alignment=16)
+        return stack
+    stack = await task.perform_async_batch(op)
+    futex_task, usedstack = await monitor.new_clone(CLONE.VM|CLONE.FILES, stack)
+    # wait for futex helper to SIGSTOP itself,
+    # which indicates the trampoline is done and we can deallocate the stack.
+    event = await futex_task.wait_for_stop_or_exit()
+    if event.died():
+        raise Exception("thread internal futex-waiting task died unexpectedly", event)
+    # resume the futex_task so it can start waiting on the futex
+    await futex_task.send_signal(signal.SIGCONT)
     # the stack will be freed as it is no longer needed, but the futex pointer will live on
     return futex_task
 
@@ -1873,7 +1879,8 @@ class ThreadMaker:
         # TODO pull this function out of somewhere sensible
         self.process_resources = process_resources
 
-    async def clone(self, flags: int, child_stack: Pointer, newtls: Pointer) -> Thread:
+    async def clone(self, flags: CLONE,
+                    child_stack: t.Tuple[handle.Pointer[Stack], WrittenPointer[Stack]]) -> CThread:
         """Provides an asynchronous interface to the CLONE_CHILD_CLEARTID functionality
 
         Executes the instruction "ret" immediately after cloning.
@@ -1886,30 +1893,12 @@ class ThreadMaker:
                                  memory.MapFlag.SHARED|memory.MapFlag.ANONYMOUS)
         futex_pointer = mapping.as_pointer()
         futex_task = await launch_futex_monitor(
-            self.task.base, self.task.transport, self.task.allocator, self.process_resources, self.monitor,
-            futex_pointer, 0)
+            self.task, self.process_resources, self.monitor, futex_pointer, 0)
         # the only part of the memory mapping that's being used now is the futex address, which is a
         # huge waste. oh well, later on we can allocate futex addresses out of a shared mapping.
-        child_task = await self.monitor.clone(
-            flags | lib.CLONE_CHILD_CLEARTID, child_stack,
-            ctid=futex_pointer, newtls=newtls)
-        return Thread(child_task, futex_task, handle.MemoryMapping(self.task.base, mapping))
-
-    async def make_cthread(self, flags: int,
-                          function: FunctionPointer, arg1=0, arg2=0, arg3=0, arg4=0, arg5=0, arg6=0,
-    ) -> CThread:
-        # allocate memory for the stack
-        stack_size = 4096
-        mapping = await self.task.mmap(stack_size, memory.ProtFlag.READ|memory.ProtFlag.WRITE, memory.MapFlag.PRIVATE)
-        stack = BufferedStack(mapping.pointer + stack_size)
-        # build stack
-        stack.push(self.process_resources.build_trampoline_stack(function, arg1, arg2, arg3, arg4, arg5, arg6))
-        # copy the stack over
-        stack_pointer = await stack.flush(self.task.transport)
-        # TODO actually allocate TLS
-        tls = self.task.address_space.null()
-        thread = await self.clone(flags|signal.SIGCHLD, stack_pointer, tls)
-        return CThread(thread, mapping)
+        child_task, usedstack = await self.monitor.new_clone(
+            flags|CLONE.CHILD_CLEARTID, child_stack, ctid=futex_pointer)
+        return CThread(Thread(child_task, futex_task, handle.MemoryMapping(self.task.base, mapping)), usedstack)
 
 class RsyscallConnection:
     "A connection to some rsyscall server where we can make syscalls"
@@ -2017,7 +2006,7 @@ class ChildConnection(base.SyscallInterface):
         await self.rsyscall_connection.close()
 
     async def _read_syscall_response(self) -> int:
-        response: int = None
+        response: t.Optional[int] = None
         try:
             async with trio.open_nursery() as nursery:
                 async def read_response() -> None:
@@ -2055,6 +2044,9 @@ class ChildConnection(base.SyscallInterface):
                 raise
         else:
             self.logger.info("returning or raising syscall response from nursery %s", response)
+        if response is None:
+            raise Exception("somehow made it out of the nursery"
+                            "without an exception and with response as None")
         raise_if_error(response)
         return response
 
@@ -2402,6 +2394,8 @@ class SocketMemoryTransport(base.MemoryTransport):
             if needs_run:
                 writes = self.pending_writes
                 self.pending_writes = []
+                if len(writes) == 0:
+                    return
                 # TODO we should not use a cancel scope shield, we should use the SyscallResponse API
                 with trio.open_cancel_scope(shield=True):
                     await self._unlocked_batch_write([(write.dest, write.data) for write in writes])
@@ -2686,20 +2680,27 @@ async def make_connections(access_task: Task,
 async def spawn_rsyscall_thread(
         access_sock: AsyncFileDescriptor,
         remote_sock: handle.FileDescriptor,
-        parent_task: Task, thread_maker: ThreadMaker, function: FunctionPointer,
+        parent_task: Task, thread_maker: ThreadMaker, process_resources: ProcessResources,
         newuser: bool, newpid: bool, fs: bool, sighand: bool,
     ) -> t.Tuple[Task, CThread]:
-    flags = lib.CLONE_VM|lib.CLONE_FILES|lib.CLONE_IO|lib.CLONE_SYSVSEM|signal.SIGCHLD
+    flags = CLONE.VM|CLONE.FILES|CLONE.IO|CLONE.SYSVSEM|Signals.SIGCHLD
     # TODO correctly track the namespaces we're in for all these things
     if newuser:
-        flags |= lib.CLONE_NEWUSER
+        flags |= CLONE.NEWUSER
     if newpid:
-        flags |= lib.CLONE_NEWPID
+        flags |= CLONE.NEWPID
     if fs:
-        flags |= lib.CLONE_FS
+        flags |= CLONE.FS
     if sighand:
-        flags |= lib.CLONE_SIGHAND
-    cthread = await thread_maker.make_cthread(flags, function, remote_sock.near, remote_sock.near)
+        flags |= CLONE.SIGHAND
+    async def op(sem: batch.BatchSemantics) -> t.Tuple[handle.Pointer[Stack], WrittenPointer[Stack]]:
+        stack_value = process_resources.make_trampoline_stack(Trampoline(
+            process_resources.server_func, [remote_sock, remote_sock]))
+        stack_buf = sem.malloc_type(handle.Stack, 4096)
+        stack = await stack_buf.write_to_end(stack_value, alignment=16)
+        return stack
+    stack = await task.perform_async_batch(op)
+    cthread = await thread_maker.clone(flags, stack)
     syscall = ChildConnection(
         RsyscallConnection(access_sock, access_sock),
         cthread.child_task,
@@ -2759,8 +2760,7 @@ async def make_robust_futex_task(
         memory.PreallocatedAllocator(remote_mapping_pointer, futex_memfd_size), futex_value)
     local_futex_pointer = local_mapping_pointer + (int(remote_futex_pointer) - int(remote_mapping_pointer))
     # now we start the futex monitor
-    futex_task = await launch_futex_monitor(parent_stdtask.task.base, parent_stdtask.task.transport,
-                                            parent_stdtask.task.allocator,
+    futex_task = await launch_futex_monitor(parent_stdtask.task,
                                             parent_stdtask.process, parent_stdtask.child_monitor,
                                             local_futex_pointer, futex_value)
     local_mapping_handle = handle.MemoryMapping(parent_stdtask.task.base, local_mapping)
