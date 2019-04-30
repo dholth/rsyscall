@@ -98,7 +98,7 @@ async def _make_local_stdtask() -> StandardTask:
     environ = {key.encode(): value.encode() for key, value in os.environ.items()}
 
     process_resources = rsc.ProcessResources(
-        server_func=_make_local_function(lib.rsyscall_server),
+        server_func=_make_local_function_handle(lib.rsyscall_server),
         persistent_server_func=_make_local_function(lib.rsyscall_persistent_server),
         do_cloexec_func=_make_local_function_handle(lib.rsyscall_do_cloexec),
         stop_then_close_func=_make_local_function_handle(lib.rsyscall_stop_then_close),

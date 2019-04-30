@@ -1133,7 +1133,7 @@ class NullGateway(memint.MemoryGateway):
 
 @dataclass
 class ProcessResources:
-    server_func: FunctionPointer
+    server_func: handle.Pointer[handle.NativeFunction]
     persistent_server_func: FunctionPointer
     do_cloexec_func: handle.Pointer[handle.NativeFunction]
     stop_then_close_func: handle.Pointer[handle.NativeFunction]
@@ -1150,7 +1150,7 @@ class ProcessResources:
                 task, NullGateway(), handle.NativeFunctionSerializer(),
                 StaticAllocation(near.Pointer(int(ffi.cast('ssize_t', cffi_ptr)))))
         return ProcessResources(
-            server_func=to_pointer(symbols.rsyscall_server),
+            server_func=to_handle(symbols.rsyscall_server),
             persistent_server_func=to_pointer(symbols.rsyscall_persistent_server),
             do_cloexec_func=to_handle(symbols.rsyscall_do_cloexec),
             stop_then_close_func=to_handle(symbols.rsyscall_stop_then_close),
@@ -1537,8 +1537,7 @@ class ChildProcess:
         self.wait_for_signal = False
         self.task = self.monitor.signal_queue.sigfd.underlying.task
         self.death_event: t.Optional[ChildEvent] = None
-        self.waiting = False
-        self.killing = False
+        self.in_use = False
 
     async def wait(self) -> t.List[ChildEvent]:
         if self.death_event:
@@ -1547,14 +1546,14 @@ class ChildProcess:
         while True:
             if self.wait_for_signal:
                 await self.monitor.do_wait()
-            if self.killing:
-                raise Exception("trying to wait while we are killing")
-            self.waiting = True
+            if self.in_use:
+                raise Exception("trying to wait while we are already waiting or killing")
+            self.in_use = True
             try:
                 siginfo_buf = await self.process.waitid(
                     flags|W.ALL|W.NOHANG, await self.task.malloc_struct(Siginfo))
             finally:
-                self.waiting = False
+                self.in_use = False
             siginfo = await siginfo_buf.read()
             if siginfo.pid == 0:
                 # we didn't get an event, so we know there's nothing to see for this pid;
@@ -1598,13 +1597,15 @@ class ChildProcess:
         if self.death_event:
             yield None
         else:
-            if self.waiting:
+            # TODO technically, multiple people could kill at the same time
+            # so this should really be a reader-writer lock
+            if self.in_use:
                 raise Exception("trying to kill while we are waiting")
-            self.killing = True
+            self.in_use = True
             try:
                 yield self.process
             finally:
-                self.killing = False
+                self.in_use = False
 
     async def send_signal(self, sig: signal.Signals) -> None:
         async with self.get_pid() as process:
@@ -1755,11 +1756,11 @@ class Thread:
     """
     child_task: ChildProcess
     futex_task: ChildProcess
-    futex_mapping: handle.MemoryMapping
-    def __init__(self, child_task: ChildProcess, futex_task: ChildProcess, futex_mapping: handle.MemoryMapping) -> None:
+    futex_ptr: handle.Pointer
+    def __init__(self, child_task: ChildProcess, futex_task: ChildProcess, futex_ptr: handle.Pointer) -> None:
         self.child_task = child_task
         self.futex_task = futex_task
-        self.futex_mapping = futex_mapping
+        self.futex_ptr = futex_ptr
         self.released = False
 
     async def execveat(self, task: Task, path: handle.Path,
@@ -1787,7 +1788,7 @@ class Thread:
         if not result.clean():
             raise Exception("the futex task", self.futex_task, "for child task", self.child_task,
                             "unexpectedly exited non-zero", result, "maybe it was SIGKILL'd?")
-        await self.futex_mapping.munmap()
+        self.futex_ptr.free()
         self.released = True
         return self.child_task
 
@@ -1813,7 +1814,7 @@ class CThread(Thread):
     """
     stack: handle.Pointer
     def __init__(self, thread: Thread, stack: handle.Pointer) -> None:
-        super().__init__(thread.child_task, thread.futex_task, thread.futex_mapping)
+        super().__init__(thread.child_task, thread.futex_task, thread.futex_ptr)
         self.stack = stack
 
     async def wait_for_mm_release(self) -> ChildProcess:
@@ -1850,10 +1851,10 @@ class BufferedStack:
 
 async def launch_futex_monitor(task: Task,
                                process_resources: ProcessResources, monitor: ChildProcessMonitor,
-                               futex_pointer: Pointer, futex_value: int) -> ChildProcess:
+                               futex_pointer: WrittenPointer[Int32]) -> ChildProcess:
     async def op(sem: batch.BatchSemantics) -> t.Tuple[handle.Pointer[Stack], WrittenPointer[Stack]]:
         stack_value = process_resources.make_trampoline_stack(Trampoline(
-            process_resources.futex_helper_func, [int(futex_pointer), futex_value]))
+            process_resources.futex_helper_func, [futex_pointer, futex_pointer.value]))
         stack_buf = sem.malloc_type(handle.Stack, 4096)
         stack = await stack_buf.write_to_end(stack_value, alignment=16)
         return stack
@@ -1886,19 +1887,20 @@ class ThreadMaker:
         Executes the instruction "ret" immediately after cloning.
 
         """
-        # the mapping is SHARED rather than PRIVATE so that the futex is shared even if CLONE_VM
-        # unshares the address space
-        # TODO not sure that actually works
-        mapping = await far.mmap(self.task.base, 4096, memory.ProtFlag.READ|memory.ProtFlag.WRITE,
-                                 memory.MapFlag.SHARED|memory.MapFlag.ANONYMOUS)
-        futex_pointer = mapping.as_pointer()
-        futex_task = await launch_futex_monitor(
-            self.task, self.process_resources, self.monitor, futex_pointer, 0)
-        # the only part of the memory mapping that's being used now is the futex address, which is a
-        # huge waste. oh well, later on we can allocate futex addresses out of a shared mapping.
+        if not (flags & CLONE.VM):
+            # This is not for any real reason - it's just that Linux, horribly,
+            # will not perform the CLEARTID futex wakeup on process death if
+            # there's only a single user of that process's mm space.
+            raise Exception("Must have CLONE.VM in flags; " +
+                            "the child must be in the same address space " +
+                            "for the CHILD_CLEARTID futex wakeup to happen")
+        # Since we have to be in the same address space anyway, we don't need to
+        # specially allocate this pointer so it is shared.
+        futex = await self.task.to_pointer(Int32(0))
+        futex_task = await launch_futex_monitor(self.task, self.process_resources, self.monitor, futex)
         child_task, usedstack = await self.monitor.new_clone(
-            flags|CLONE.CHILD_CLEARTID, child_stack, ctid=futex_pointer)
-        return CThread(Thread(child_task, futex_task, handle.MemoryMapping(self.task.base, mapping)), usedstack)
+            flags|CLONE.CHILD_CLEARTID, child_stack, ctid=futex)
+        return CThread(Thread(child_task, futex_task, futex), usedstack)
 
 class RsyscallConnection:
     "A connection to some rsyscall server where we can make syscalls"
@@ -2593,6 +2595,17 @@ async def set_singleton_robust_futex(task: far.Task, transport: base.MemoryTrans
 ) -> Pointer:
     futex_offset = ffi.sizeof('struct robust_list')
     def op(sem: BatchSemantics) -> t.Tuple[BatchPointer, BatchPointer]:
+        robust_list_entry_buf = sem.malloc_type(Bytes, RobustListEntry.sizeof())
+        # uhhhh, reinterpret invalidates the pointer, so how do I get a valid self-reference in to RLS?
+        robust_list_entry = robust_list_entry_buf._reinterpret(RobustListSerializer(robust_list_entry_buf))
+        robust_list_entry.write(RobustList(None, futex_value))
+        robust_list_head = sem.to_pointer(RobustListHead(robust_list_entry))
+        # need to return the futex pointer too??? hmm...
+        # maybe split?
+        # maybe can just pass around the robust list entry and pull out the futex?
+        return robust_list_entry, robust_list_head
+
+    def op(sem: BatchSemantics) -> t.Tuple[BatchPointer, BatchPointer]:
         def robust_list(self: int) -> bytes:
             return (bytes(ffi.buffer(ffi.new('struct robust_list*', (ffi.cast('void*', self),))))
                     + struct.pack('=I', futex_value))
@@ -2699,7 +2712,7 @@ async def spawn_rsyscall_thread(
         stack_buf = sem.malloc_type(handle.Stack, 4096)
         stack = await stack_buf.write_to_end(stack_value, alignment=16)
         return stack
-    stack = await task.perform_async_batch(op)
+    stack = await parent_task.perform_async_batch(op)
     cthread = await thread_maker.clone(flags, stack)
     syscall = ChildConnection(
         RsyscallConnection(access_sock, access_sock),

@@ -14877,7 +14877,7 @@ including entire tasks - when we drop the task, we drop the process, and it dies
 
     Then I could do this without an extra thread!
     That would be... great!
-*** batch waitids
+** DONE batch waitids
     OK ok, this seems interesting and cool.
     (the idea was obvious as soon as I posed it as, request a batch waitid)
 
@@ -14901,7 +14901,7 @@ including entire tasks - when we drop the task, we drop the process, and it dies
     That's distasteful, but... it's the only non-racy way to do it.
 
     And, practically, it's still O(M), since we'll batch the syscalls.
-** mysteriousness
+** DONE mysteriousness
    Seems I'm sending syscalls but never actually writing them.
 
    Oh well maybe that's fine actually, could be due to cancellation or whatever
@@ -14912,7 +14912,23 @@ including entire tasks - when we drop the task, we drop the process, and it dies
    We should prioritize reading things out of the syscall connection buffer,
    to running waitids for the futex and child task.
    After all if there's something in the buffer, we should look at it
-** DONE store reaper status on the task
+** futex in handle style
+*** need to allocate shared memory
+    Hmm
+
+    OK so I could allow a page?
+
+    OK so. I have this memfd. I can make this memfd, map it, then make an allocator from it.
+*** need to pass around pointer to futex embedded in other structure
+*** need to handle self-reference in robust list
+    I started on this but I'm still not through,
+    since doing a reinterpret and passing the serializer doesn't actually work,
+    since it invalidates the old pointer.
+** split out both spawn_exec and fork task creation
+   There are two task creation things still in io.py!
+** migrate everything to use robust lists
+   Yeah hm, instead of using ctid.
+** DONE maybe store reaper status on the task
    So that we know whether or not CLONE_PARENT is allowed, I guess.
 
    Eh, no, it should just fail with an exception. Not a big deal!
