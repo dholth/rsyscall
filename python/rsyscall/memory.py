@@ -6,7 +6,7 @@ import rsyscall.raw_syscalls as raw_syscall
 import rsyscall.near
 import rsyscall.far as far
 import rsyscall.handle as handle
-from rsyscall.handle import AllocationInterface
+from rsyscall.handle import AllocationInterface, MemoryMapping
 import trio
 import abc
 import enum
@@ -119,6 +119,18 @@ class AnonymousMapping:
     async def __aexit__(self, *args, **kwargs):
         await self.unmap()
 
+class AllocatorInterface:
+    async def bulk_malloc(self, sizes: t.List[t.Tuple[int, int]]) -> t.Sequence[AllocationInterface]:
+        # A naive bulk allocator
+        allocs: t.List[AllocationInterface] = []
+        with contextlib.ExitStack() as stack:
+            for size, alignment in sizes:
+                allocs.append(await self.malloc(size, alignment))
+            return allocs
+
+    @abc.abstractmethod
+    async def malloc(self, size: int, alignment: int) -> AllocationInterface: ...
+
 class Arena:
     def __init__(self, mapping: AnonymousMapping) -> None:
         self.mapping = mapping
@@ -152,17 +164,12 @@ def align(num: int, alignment: int) -> int:
     else:
         return num
 
-class AllocatorInterface:
-    async def bulk_malloc(self, sizes: t.List[t.Tuple[int, int]]) -> t.Sequence[AllocationInterface]:
-        # A naive bulk allocator
-        allocs: t.List[AllocationInterface] = []
-        with contextlib.ExitStack() as stack:
-            for size, alignment in sizes:
-                allocs.append(await self.malloc(size, alignment))
-            return allocs
+class SingleMappingAllocator(AllocatorInterface):
+    def __init__(self, mapping: AnonymousMapping) -> None:
+        pass
 
-    @abc.abstractmethod
-    async def malloc(self, size: int, alignment: int) -> AllocationInterface: ...
+    async def malloc(self, size: int, alignment: int) -> AllocationInterface:
+        pass
 
 class PreallocatedAllocation(AllocationInterface):
     def __init__(self, pointer: Pointer, size: int) -> None:
