@@ -71,6 +71,17 @@ class LocalMemoryTransport(base.MemoryTransport):
             ret.append(bytes(buf))
         return ret
 
+class LocalMemoryAccess(base.MemoryAccess):
+    # OK so to implement this, we need an allocator for the local address space,
+    # and, um...
+    # even if we were directly returning pointers, I think we'd need to know the local address space.
+    # but wait, we can pull that directly from the local task!
+    # nice, nice, just task.address_space.
+    # and we use the local
+    async def to_pointer(self, data: bytes) -> Pointer: ...
+    async def malloc(self, n: int) -> Pointer: ...
+    async def read(self, ptr: Pointer) -> bytes: ...
+
 def _make_local_task() -> Task:
     pid = os.getpid()
     pid_namespace = far.PidNamespace(pid)

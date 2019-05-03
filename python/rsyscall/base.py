@@ -25,24 +25,12 @@ class MemoryTransport(MemoryGateway):
     @abc.abstractmethod
     def inherit(self, task: Task) -> MemoryTransport: ...
 
-class MemoryAbstractor:
-    # should we return AllocationInterfaces, or Pointers directly?
-    # returning Pointers would be nicer for the user...
-    # allocationinterface is more direct and exposes more internals to the user, though...
-    # hmMmMmmMmm
-    # ah but I can just have to_pointer etc be helpers on the interface, which call the real interface methods.
-    # that is optimal
-
-    # oh yeah we don't want to return pointers anyway, because this isn't our exact interface;
-    # we want somethign typed
+class MemoryAccess:
+    # hmm so what exactly should we return here?
+    # I guess, sure, a pointer.
     @abc.abstractmethod
-    def to_pointer(self, data: bytes) -> Pointer: ...
+    async def to_pointer(self, data: bytes) -> Pointer: ...
     @abc.abstractmethod
-    def malloc(self, n: int) -> Pointer: ...
+    async def malloc(self, n: int) -> Pointer: ...
     @abc.abstractmethod
-    def read(self, ptr: Pointer) -> bytes: ...
-    # these three are good interfaces
-
-local_address_space = AddressSpace(os.getpid())
-def to_local_pointer(data: t.Union[bytes, bytearray]) -> Pointer:
-    return Pointer(local_address_space, rsyscall.near.Pointer(int(ffi.cast('long', ffi.from_buffer(data)))))
+    async def read(self, ptr: Pointer) -> bytes: ...

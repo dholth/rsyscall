@@ -2318,6 +2318,7 @@ class SocketMemoryTransport(base.MemoryTransport):
 
     """
     local: AsyncFileDescriptor
+    local_access: base.MemoryAccess
     remote: handle.FileDescriptor
     # This is a more efficient transport used if the two sockets are in the same address space;
     # which is essentially only the case when we're transporting to a thread.
@@ -2362,8 +2363,7 @@ class SocketMemoryTransport(base.MemoryTransport):
         return SocketMemoryTransport(self.local, task.make_fd_handle(self.remote), self.direct_transport)
 
     async def _unlocked_single_write(self, dest: Pointer, data: bytes) -> None:
-        # need an additional cap: to turn bytes to a pointer.
-        src = base.to_local_pointer(data)
+        src = await self.local_access.to_pointer(data)
         n = len(data)
         rtask = self.remote.task
         near_read_fd = self.remote.near
@@ -2429,8 +2429,7 @@ class SocketMemoryTransport(base.MemoryTransport):
                 op.assert_done()
 
     async def _unlocked_single_read(self, src: Pointer, n: int) -> bytes:
-        buf = bytearray(n)
-        dest = base.to_local_pointer(buf)
+        dest = await self.local_access.malloc(n)
         rtask = self.local.underlying.task.base
         near_dest = rtask.to_near_pointer(dest)
         near_read_fd = self.local.underlying.handle.near
@@ -2450,7 +2449,7 @@ class SocketMemoryTransport(base.MemoryTransport):
         async with trio.open_nursery() as nursery:
             nursery.start_soon(read)
             nursery.start_soon(write)
-        return bytes(buf)
+        return await self.local_access.read(dest)
 
     async def _unlocked_batch_read(self, ops: t.List[ReadOp]) -> None:
         for op in ops:
